@@ -3,9 +3,10 @@
 """
 import skimage.util
 import numpy as np
+from skimage.morphology import remove_small_holes
 
 
-class BadWatermarking(Exception):
+class BadWatermark(Exception):
     """Класс ошибки некорректного водяного знака."""
     pass
 
@@ -106,11 +107,70 @@ class SiPDataGrid(CoverGrid):
         self.AvgB = None
         self.AvgR = None
         self.D = None
-        self.Pr = 2  # ширина "красного" эллипсоида
-        self.Pb = 2  # ширина "синего" эллипсоида
-        self.c_opt = 0.1  # аддитивная константа, повышающая надежность записи
-        self.ell_mask_red = None
-        self.ell_mask_blue = None
+        self.c_opt = 1.0  # аддитивная константа, повышающая надежность записи
+
+    @staticmethod
+    def __get_ellipse_mask(image_shape, n_step=0):
+        """
+        рисует эллипсную маску
+        :param image_shape: размеры изображения
+        :param n_step: отступ в пикселях от
+        :return:
+        """
+        mask = np.zeros(image_shape, dtype=int)
+        h, w = image_shape
+        x_0, y_0 = (w - 1) / 2, (h - 1) / 2
+        a, b = (w - 1) / 2 - n_step, (h - 1) / 2 - n_step
+        # отображение x -> y
+        x = np.arange(n_step, np.floor(x_0))
+        y = np.round(y_0 - b * np.sqrt(1 - ((x - x_0) / a) ** 2))
+        x, y = x.astype(int), y.astype(int)
+        for j, i in zip(x, y):
+            mask[i, j] = 1
+            mask[h - 1 - i, j] = 1
+            mask[i, w - 1 - j] = 1
+            mask[h - 1 - i, w - 1 - j] = 1
+        # отображение y -> (x, -x)
+        y = np.arange(n_step, np.floor(y_0))
+        x = np.round(x_0 - a * np.sqrt(1 - ((y - y_0) / b) ** 2))
+        x, y = x.astype(int), y.astype(int)
+        for j, i in zip(x, y):
+            mask[i, j] = 1
+            mask[h - 1 - i, j] = 1
+            mask[i, w - 1 - j] = 1
+            mask[h - 1 - i, w - 1 - j] = 1
+        return mask
+
+    def get_red_and_ellipsoidal_annuli(self):
+        """
+        возвращает маски красныго и синего эллипсоидного кольца
+        :return:
+        """
+        # красное эллипсное кольцо
+        ell_mask_red = self.__get_ellipse_mask((self.block_height, self.block_width), n_step=0)
+        ell_mask_red += self.__get_ellipse_mask((self.block_height, self.block_width), n_step=1)
+        # синие эллипсное кольцо
+        ell_mask_blue = ell_mask_red.copy()
+        ell_mask_blue += self.__get_ellipse_mask((self.block_height, self.block_width), n_step=2)
+        ell_mask_blue += self.__get_ellipse_mask((self.block_height, self.block_width), n_step=3)
+        # float -> bool
+        ell_mask_red = ell_mask_red.astype(bool)
+        ell_mask_blue = ell_mask_blue.astype(bool)
+        # fill holes
+        ell_mask_red = remove_small_holes(ell_mask_red)
+        ell_mask_blue = remove_small_holes(ell_mask_blue)
+        # вычитаем из синего элипсоидного кольца красное
+        ell_mask_blue = np.logical_xor(ell_mask_blue, ell_mask_red)
+        '''
+        ell_mask_red = np.ones((self.block_height, self.block_width), dtype=int)
+        ell_mask_red[2:-2, 2:-2] = 0
+        ell_mask_blue = np.ones((self.block_height, self.block_width), dtype=int)
+        ell_mask_blue[4:-4, 4:-4] = 0
+        ell_mask_blue = ell_mask_blue - ell_mask_red
+        ell_mask_red = ell_mask_red.astype(bool)
+        ell_mask_blue = ell_mask_blue.astype(bool)
+        '''
+        return ell_mask_red, ell_mask_blue
 
     def red_blue2d(self):
         """
@@ -119,21 +179,15 @@ class SiPDataGrid(CoverGrid):
         :return:
         """
         # маска для выделения эллипсоидов
-        self.ell_mask_red = np.ones((self.block_height, self.block_width), dtype=int)
-        self.ell_mask_red[2:-2, 2:-2] = 0
-        self.ell_mask_blue = np.ones((self.block_height, self.block_width), dtype=int)
-        self.ell_mask_blue[4:-4, 4:-4] = 0
-        self.ell_mask_blue = self.ell_mask_blue - self.ell_mask_red
-        self.ell_mask_red = self.ell_mask_red.astype(bool)
-        self.ell_mask_blue = self.ell_mask_blue.astype(bool)
+        ell_mask_red, ell_mask_blue = self.get_red_and_ellipsoidal_annuli()
 
         self.AvgB = np.zeros((self.nrows, self.ncols))
         self.AvgR = np.zeros((self.nrows, self.ncols))
 
         for i in range(self.nrows):
             for j in range(self.ncols):
-                self.AvgR[i, j] = self.image_blocks_magnitude[i, j, self.ell_mask_red].mean()
-                self.AvgB[i, j] = self.image_blocks_magnitude[i, j, self.ell_mask_blue].mean()
+                self.AvgR[i, j] = self.image_blocks_magnitude[i, j, ell_mask_red].mean()
+                self.AvgB[i, j] = self.image_blocks_magnitude[i, j, ell_mask_blue].mean()
         # Вычисляем матрицу D
         self.D = self.AvgB - self.AvgR
 
@@ -142,14 +196,14 @@ class SiPDataGrid(CoverGrid):
         Записываем двумерное представления водяного знака в D матрицу in bitmap
         :return:
         """
-        d = self.D.copy()
-        d[d > 0] = 0
-        d = abs(d)
         # максимальное значение для каждой строки
-        max_d = np.max(d, axis=1)
+        max_d = np.min(self.D, axis=1)
+        max_d[max_d > 0] = 0
+        max_d = np.abs(max_d)
         # Пишем биты
+        ell_mask_red, _ = self.get_red_and_ellipsoidal_annuli()
         for i, j in bitmap.keys():
-            self.image_blocks_magnitude[i, j, self.ell_mask_red] += self.AvgB[i, j] - self.AvgR[i, j] + max_d[i] + self.c_opt
+            self.image_blocks_magnitude[i, j, ell_mask_red] += self.AvgB[i, j] - self.AvgR[i, j] + max_d[i] + self.c_opt
 
     def read_d(self):
         """
@@ -171,12 +225,13 @@ class WmSiP(SiPDataGrid):
         self.wm = None  # водяной знак
         self.A = {}  # матричное представление водяного знака
 
-    def wm_write(self, watermark):
+    def wm_write(self, watermark, c=1.0):
         """
         Запись водяного знака на изображение.
         :return:
         """
         self.wm = watermark
+        self.c_opt = c
         # ПРОВЕРИТЬ НА ВОЗМОЖНОСТЬ ДАННОГО РАЗБИЕНИЯ
         self.__get_2d_wm_rep()  # строим матричное представление
         # создаем разбиение изображения на блоки
@@ -224,11 +279,11 @@ class WmSiP(SiPDataGrid):
         for i in range(n):
             row_sum = sum([self.A.get((i, j), 0) for j in range(n)])
             if row_sum != 1:
-                raise BadWatermarking
+                raise BadWatermark
         # матрица должна быть симметричной
         for i, j in self.A.keys():
             if (j, i) not in self.A.keys():
-                raise BadWatermarking
+                raise BadWatermark
 
 
 class WmLuComp:
@@ -257,7 +312,7 @@ if __name__ == '__main__':
     # создаем экземпляр класса с изображением im
     wm_sip = WmSiP(img)
     # записываем на изображение водяной знак
-    wm_sip.wm_write(p)
+    wm_sip.wm_write(p, c=0.4)
     # читаем изображение с водяным знаком
     wm_img = wm_sip.get_wm_image()
     # вычисляем различие между изображениями    
@@ -265,9 +320,11 @@ if __name__ == '__main__':
     print(delta_img.ravel().sum())
     # Читаем водяной знак
     wm_sip = WmSiP(wm_img)
-    s = wm_sip.wm_read(len(p))
-    print('sip', s)
+    try:
+        s = wm_sip.wm_read(len(p))
+    except BadWatermark:
+        print('watermark not found')
+    else:
+        print('sip', s)
     # skimage.io.imsave('tmp.tiff', wm_img)
     # skimage.io.imshow(wm_img)
-
-    print('Test OK')
