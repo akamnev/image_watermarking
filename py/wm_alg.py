@@ -1,9 +1,10 @@
 """
 Реализованы алгоритмы добавления водяных знаков на изображение
 """
-import skimage.util
+from skimage.util import view_as_blocks
 import numpy as np
 from skimage.morphology import remove_small_holes
+from scipy.fftpack import dct, idct
 
 
 class BadWatermark(Exception):
@@ -25,6 +26,7 @@ class CoverGrid:
         self.image_blocks = None
         self.image_blocks_magnitude = None
         self.image_blocks_phase = None
+        self.dct_params = {'type': 2, 'norm': 'ortho'}  # параметры дискретного преобразования косинусов
 
     def create_grid(self, height, width):
         """
@@ -38,7 +40,7 @@ class CoverGrid:
         self.ncols = w // self.block_width
         self.image_clone = self.image[:self.block_height * self.nrows, :self.block_width * self.ncols].copy()
         # разбиваем скопированную часть изображения на блоки
-        self.image_blocks = skimage.util.view_as_blocks(self.image_clone, (self.block_height, self.block_width))
+        self.image_blocks = view_as_blocks(self.image_clone, (self.block_height, self.block_width))
 
     def foreach_dft(self):
         """
@@ -86,6 +88,29 @@ class CoverGrid:
                 # собираем изображение
                 block_dft = np.multiply(magnitude, np.exp(self.image_blocks_phase[i, j, ...] * 1j))
                 self.image_blocks[i, j, ...] = np.abs(np.fft.ifft2(block_dft))
+
+    def foreach_dct(self):
+        """
+        Выполняет дискретное преобразование косинусов для каждого блока
+        :return:
+        """
+        self.image_blocks_magnitude = np.zeros(self.image_blocks.shape)
+        for i in range(self.nrows):
+            for j in range(self.ncols):
+                # транспонирование необходимо для того, чтобы сумма модулей первого столбца была меньше суммы модулей
+                # первой строки. Важное свойство!
+                self.image_blocks_magnitude[i, j, ...] = np.transpose(dct(self.image_blocks[i, j, ...],
+                                                                          **self.dct_params))
+
+    def foreach_idct(self):
+        """
+        Выполняет обратное дискретное преобразование косинусов
+        :return:
+        """
+        for i in range(self.nrows):
+            for j in range(self.ncols):
+                self.image_blocks[i, j, ...] = idct(np.transpose(self.image_blocks_magnitude[i, j, ...]),
+                                                    **self.dct_params)
 
     def get_wm_image(self):
         """
@@ -143,7 +168,7 @@ class SiPDataGrid(CoverGrid):
 
     def get_red_and_ellipsoidal_annuli(self):
         """
-        возвращает маски красныго и синего эллипсоидного кольца
+        возвращает маски красного и синего эллипсоидных колец
         :return:
         """
         # красное эллипсное кольцо
@@ -286,7 +311,7 @@ class WmSiP(SiPDataGrid):
                 raise BadWatermark
 
 
-class WmLuComp:
+class WmLuComp(CoverGrid):
     """
     Реализания алгоритма добавление/чтения водяных знаков наизображении
     Описание алгоритма дано в оригинальной статье:
@@ -295,28 +320,131 @@ class WmLuComp:
     ELEKTRONIKA IR ELEKTROTECHNIKA , ISSN  1392-1215 , VOL . 19 , NO . 4 , 2013
     http://dx.doi.org/10.5755/j01.eee.19.4.2015
     """
-    pass
+    def __init__(self, image):
+        # convert color space from RGB to YCbCr
+        y, self.cb, self.cr = self.__ycc(image)
+        CoverGrid.__init__(self, image=y)
+        # так как известны размеры блоков, то в конструкторе можем сразу сделать разбиение на блоки
+        # и выполнить дискретное преобразование косинусов - последнее сложнее реализовать
+        CoverGrid.create_grid(self, height=8, width=8)
+
+    def wm_write(self, watermark, c=1.0):
+        """
+        Запись водяного знака на изображение
+        :param watermark:
+        :param c:
+        :return:
+        """
+        # TODO: проверить допустимость водяного знака
+        # дискретное преобразование косинусов
+        self.foreach_dct()
+        # запись изображения.
+        # TODO: Работа с усредненными элементаки не работает!
+        for i in range(self.nrows):
+            for j in range(self.ncols):
+                m = self.image_blocks_magnitude[i, j, ...]
+                if watermark[i, j] == 1:
+                    if m[4, 1] < m[3, 2]:
+                        m[4, 1], m[3, 2] = m[3, 2], m[4, 1]
+                    m[4, 1] += c
+                else:
+                    if m[3, 2] < m[4, 1]:
+                        m[4, 1], m[3, 2] = m[3, 2], m[4, 1]
+                    m[3, 2] += c
+        # обратное дискретное преобразовине косинусов: водяной знак записан
+        self.foreach_idct()
+
+    def wm_read(self, nrows=None, ncols=None):
+        """
+        Читает записанный водяной знак
+        :param nrows: количество строк в водяном знаке, если None, то максимально возможное количество
+        :param ncols: количество строк в водяном знаке, если None, то максимально возможное количество
+        :return: бинарное изображение водяного знака
+        """
+        nrows = nrows if nrows else self.nrows
+        ncols = ncols if ncols else self.ncols
+
+        watermark = np.zeros((nrows, ncols), dtype=np.uint8)
+        # дискретное преобразование косинусов
+        self.foreach_dct()
+        # чтение
+        for i in range(nrows):
+            for j in range(ncols):
+                m = self.image_blocks_magnitude[i, j, ...]
+                watermark[i, j] = 1 if m[4, 1] > m[3, 2] else 0
+        return watermark
+
+    def get_wm_image(self):
+        """
+        Выдает изображение в RGB цветовой схеме
+        :return:
+        """
+        y_wm = CoverGrid.get_wm_image(self)
+        return self.__rgb(y_wm, self.cb, self.cr)
+
+    @staticmethod
+    def __ycc(rgb):
+        """
+        Convert color space from RGB to YCbCr.
+        :return:
+        """
+        # check range
+        min_color, max_color = np.min(rgb.ravel()), np.max(rgb.ravel())
+        rgb = (rgb - min_color) / (max_color - min_color) * 255
+        # split by colors
+        r = rgb[:, :, 0]
+        g = rgb[:, :, 1]
+        b = rgb[:, :, 2]
+
+        y = .299 * r + .587 * g + .114 * b
+        cb = 128 - .168736 * r - .331364 * g + .5 * b
+        cr = 128 + .5 * r - .418688 * g - .081312 * b
+        return y, cb, cr
+
+    @staticmethod
+    def __rgb(y, cb, cr):
+        """
+        Convert color space from YCbCr to RGB
+        :param y:
+        :param cb:
+        :param cr:
+        :return:
+        """
+        # B: (y, cb, cr) -> (r, g, b)
+        b = np.linalg.inv(np.array([[0.299, 0.587, 0.114],
+                                    [-0.168736, -0.331364, 0.5],
+                                    [0.5, -0.418688, -0.081312]]))
+        r = b[0, 0] * y + b[0, 1] * (cb - 128) + b[0, 2] * (cr - 128)
+        g = b[1, 0] * y + b[1, 1] * (cb - 128) + b[1, 2] * (cr - 128)
+        b = b[2, 0] * y + b[2, 1] * (cb - 128) + b[2, 2] * (cr - 128)
+        image = np.zeros((r.shape[0], r.shape[1], 3))
+        image[:, :, 0] = r
+        image[:, :, 1] = g
+        image[:, :, 2] = b
+        image[image < 0] = 0
+        image[image > 255] = 255
+        return np.round(image).astype(np.uint8)
 
 
 if __name__ == '__main__':
     import skimage.data
-    import skimage.io
-    import skimage.color
+    # from skimage.io import imshow
+    from skimage.color import rgb2gray
     # тестовый водный знак
     # p = [5, 6, 9, 8, 1, 2, 7, 4, 3]
     p = [6, 3, 2, 4, 5, 1]
     p = [x-1 for x in p]
     # тестовое изображение
     img = skimage.data.astronaut()
-    img = skimage.color.rgb2gray(img)
+    img_gray = rgb2gray(img)
     # создаем экземпляр класса с изображением im
-    wm_sip = WmSiP(img)
+    wm_sip = WmSiP(img_gray)
     # записываем на изображение водяной знак
     wm_sip.wm_write(p, c=0.4)
     # читаем изображение с водяным знаком
     wm_img = wm_sip.get_wm_image()
     # вычисляем различие между изображениями    
-    delta_img = wm_img - img
+    delta_img = wm_img - img_gray
     print(delta_img.ravel().sum())
     # Читаем водяной знак
     wm_sip = WmSiP(wm_img)
@@ -326,5 +454,17 @@ if __name__ == '__main__':
         print('watermark not found')
     else:
         print('sip', s)
+
+    # создаем случайное бинарное изображение
+    bitmap = np.random.randint(2, size=(img.shape[0] // 8, img.shape[1] // 8))
+    # write watermark
+    wm_lum = WmLuComp(img)
+    wm_lum.wm_write(bitmap, c=2.0)
+    wm_img = wm_lum.get_wm_image()
+    # read watermark
+    wm_lum = WmLuComp(wm_img)
+    wm_bitmap = wm_lum.wm_read()
+    err = np.abs(bitmap - wm_bitmap)
+    print('error:', err.ravel().sum(), err.ravel().sum()/ len(err.ravel()))
     # skimage.io.imsave('tmp.tiff', wm_img)
     # skimage.io.imshow(wm_img)
