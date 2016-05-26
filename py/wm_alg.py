@@ -7,8 +7,55 @@ from skimage.morphology import remove_small_holes
 from scipy.fftpack import dct, idct
 
 
+def _ycc(rgb):
+    """
+    Convert color space from RGB to YCbCr.
+    :return:
+    """
+    # check range
+    min_color, max_color = np.min(rgb.ravel()), np.max(rgb.ravel())
+    rgb = (rgb - min_color) / (max_color - min_color) * 255
+    # split by colors
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+
+    y = .299 * r + .587 * g + .114 * b
+    cb = 128 - .168736 * r - .331364 * g + .5 * b
+    cr = 128 + .5 * r - .418688 * g - .081312 * b
+    return y, cb, cr
+
+
+def _rgb(y, cb, cr):
+    """
+    Convert color space from YCbCr to RGB
+    :param y:
+    :param cb:
+    :param cr:
+    :return:
+    """
+    # B: (y, cb, cr) -> (r, g, b)
+    b = np.linalg.inv(np.array([[0.299, 0.587, 0.114],
+                                [-0.168736, -0.331364, 0.5],
+                                [0.5, -0.418688, -0.081312]]))
+    r = b[0, 0] * y + b[0, 1] * (cb - 128) + b[0, 2] * (cr - 128)
+    g = b[1, 0] * y + b[1, 1] * (cb - 128) + b[1, 2] * (cr - 128)
+    b = b[2, 0] * y + b[2, 1] * (cb - 128) + b[2, 2] * (cr - 128)
+    image = np.zeros((r.shape[0], r.shape[1], 3))
+    image[:, :, 0] = r
+    image[:, :, 1] = g
+    image[:, :, 2] = b
+    image[image < 0] = 0
+    image[image > 255] = 255
+    return np.round(image).astype(np.uint8)
+
+
 class BadWatermark(Exception):
     """Класс ошибки некорректного водяного знака."""
+    pass
+
+
+class UnknownAlgorithm(Exception):
     pass
 
 
@@ -246,9 +293,15 @@ class WmSiP(SiPDataGrid):
     "WATERMARKING IMAGES IN THE FREQUENCY DOMAIN BY EXPLOITING SELF-INVERTING PERMUTATIONS"
     """
     def __init__(self, image):
-        SiPDataGrid.__init__(self, image=image)
+        # TODO: почему необходимо масшабировать до диапазона [0, 1]?
+        # scale to range [0, 1]
+        image_cl = image.copy()
+        img_max, img_min = np.max(image_cl.ravel()), np.min(image_cl.ravel())
+        image_cl = (image_cl - img_min) / (img_max - img_min)
+        SiPDataGrid.__init__(self, image=image_cl)
         self.wm = None  # водяной знак
         self.A = {}  # матричное представление водяного знака
+        self.name = 'SiP'
 
     def wm_write(self, watermark, c=1.0):
         """
@@ -273,11 +326,13 @@ class WmSiP(SiPDataGrid):
         # обратное дискретное преобразование Фурье
         SiPDataGrid.foreach_idft(self)
 
-    def wm_read(self, wm_len):
+    def wm_read(self, shape):
         """
         Чтение записанного на изображение водяного знака.
+        :param shape: (len, ) длина водяного знака
         :return:
         """
+        wm_len, = shape
         # создаем разбиение изображения на блоки
         im_h, im_w = self.image.shape
         SiPDataGrid.create_grid(self, height=im_h // wm_len, width=im_w // wm_len)
@@ -310,6 +365,18 @@ class WmSiP(SiPDataGrid):
             if (j, i) not in self.A.keys():
                 raise BadWatermark
 
+    def get_wm_image(self):
+        """
+        возвращаме изображение с водяными знаками
+        :return:
+        """
+        img = SiPDataGrid.get_wm_image(self)
+        # scale to range [0, 255]
+        img *= 255
+        img[img < 0] = 0
+        img[img > 255] = 255
+        return np.round(img).astype(np.uint8)
+
 
 class WmLuComp(CoverGrid):
     """
@@ -322,11 +389,12 @@ class WmLuComp(CoverGrid):
     """
     def __init__(self, image):
         # convert color space from RGB to YCbCr
-        y, self.cb, self.cr = self.__ycc(image)
+        y, self.cb, self.cr = _ycc(image)
         CoverGrid.__init__(self, image=y)
         # так как известны размеры блоков, то в конструкторе можем сразу сделать разбиение на блоки
         # и выполнить дискретное преобразование косинусов - последнее сложнее реализовать
         CoverGrid.create_grid(self, height=8, width=8)
+        self.name = 'LuComp'
 
     def wm_write(self, watermark, c=1.0):
         """
@@ -354,13 +422,13 @@ class WmLuComp(CoverGrid):
         # обратное дискретное преобразовине косинусов: водяной знак записан
         self.foreach_idct()
 
-    def wm_read(self, nrows=None, ncols=None):
+    def wm_read(self, shape=(None, None)):
         """
         Читает записанный водяной знак
-        :param nrows: количество строк в водяном знаке, если None, то максимально возможное количество
-        :param ncols: количество строк в водяном знаке, если None, то максимально возможное количество
+        :param shape: (nrows, ncols) количество строк в водяном знаке, если None, то максимально возможное количество
         :return: бинарное изображение водяного знака
         """
+        nrows, ncols = shape
         nrows = nrows if nrows else self.nrows
         ncols = ncols if ncols else self.ncols
 
@@ -380,50 +448,61 @@ class WmLuComp(CoverGrid):
         :return:
         """
         y_wm = CoverGrid.get_wm_image(self)
-        return self.__rgb(y_wm, self.cb, self.cr)
+        return _rgb(y_wm, self.cb, self.cr)
 
-    @staticmethod
-    def __ycc(rgb):
+
+class Watermark:
+    """
+    Добавляет водяной знак на изображение.
+    """
+    def __init__(self, image, algorithm):
+        self.image = image
+        self.alg = []
+        if algorithm == 'SiP':
+            self.alg = [WmSiP(self.image[:, :, i]) for i in range(self.image.shape[2])]
+        elif algorithm == 'LuComp':
+            self.alg = [WmLuComp(self.image)]
+        else:
+            raise UnknownAlgorithm
+
+    def watermark_write(self, watermark, c=1.0):
         """
-        Convert color space from RGB to YCbCr.
+        запись водяного знака
+        :param watermark:
+        :param c
         :return:
         """
-        # check range
-        min_color, max_color = np.min(rgb.ravel()), np.max(rgb.ravel())
-        rgb = (rgb - min_color) / (max_color - min_color) * 255
-        # split by colors
-        r = rgb[:, :, 0]
-        g = rgb[:, :, 1]
-        b = rgb[:, :, 2]
+        # пишем водяной знак
+        for alg in self.alg:
+            alg.wm_write(watermark, c)
+        # возвращаем изображение
+        im_wm = []
+        for alg in self.alg:
+            im_wm.append(alg.get_wm_image())
+        # если изображение чернобелое или сразу собрано, то просто возвращаем его
+        if len(im_wm) == 1:
+            return im_wm[0]
+        # иначе собираем изобаржение
+        # TODO: сложно выглядит, надо попробовать через concatenate
+        res_img = np.zeros(self.image.shape, dtype=np.uint8)
+        for i in range(len(im_wm)):
+            res_img[:, :, i] = im_wm[i]
+        return res_img
 
-        y = .299 * r + .587 * g + .114 * b
-        cb = 128 - .168736 * r - .331364 * g + .5 * b
-        cr = 128 + .5 * r - .418688 * g - .081312 * b
-        return y, cb, cr
-
-    @staticmethod
-    def __rgb(y, cb, cr):
+    def watermark_read(self, shape=(None, None)):
         """
-        Convert color space from YCbCr to RGB
-        :param y:
-        :param cb:
-        :param cr:
+        чтение водяного знака
+        :param algorithm:
+        :param shape:
         :return:
         """
-        # B: (y, cb, cr) -> (r, g, b)
-        b = np.linalg.inv(np.array([[0.299, 0.587, 0.114],
-                                    [-0.168736, -0.331364, 0.5],
-                                    [0.5, -0.418688, -0.081312]]))
-        r = b[0, 0] * y + b[0, 1] * (cb - 128) + b[0, 2] * (cr - 128)
-        g = b[1, 0] * y + b[1, 1] * (cb - 128) + b[1, 2] * (cr - 128)
-        b = b[2, 0] * y + b[2, 1] * (cb - 128) + b[2, 2] * (cr - 128)
-        image = np.zeros((r.shape[0], r.shape[1], 3))
-        image[:, :, 0] = r
-        image[:, :, 1] = g
-        image[:, :, 2] = b
-        image[image < 0] = 0
-        image[image > 255] = 255
-        return np.round(image).astype(np.uint8)
+        watermark = []
+        for alg in self.alg:
+            try:
+                watermark.append(alg.wm_read(shape))
+            except BadWatermark:
+                watermark.append(None)
+        return  watermark
 
 
 if __name__ == '__main__':
@@ -437,19 +516,20 @@ if __name__ == '__main__':
     # тестовое изображение
     img = skimage.data.astronaut()
     img_gray = rgb2gray(img)
+    # img_gray = img[:, :, 0]
     # создаем экземпляр класса с изображением im
     wm_sip = WmSiP(img_gray)
     # записываем на изображение водяной знак
-    wm_sip.wm_write(p, c=0.4)
+    wm_sip.wm_write(p, c=1.0)
     # читаем изображение с водяным знаком
-    wm_img = wm_sip.get_wm_image()
+    wm_img1 = wm_sip.get_wm_image()
     # вычисляем различие между изображениями    
-    delta_img = wm_img - img_gray
+    delta_img = wm_img1 - img_gray
     print(delta_img.ravel().sum())
     # Читаем водяной знак
-    wm_sip = WmSiP(wm_img)
+    wm_sip = WmSiP(wm_img1)
     try:
-        s = wm_sip.wm_read(len(p))
+        s = wm_sip.wm_read((len(p),))
     except BadWatermark:
         print('watermark not found')
     else:
@@ -460,11 +540,25 @@ if __name__ == '__main__':
     # write watermark
     wm_lum = WmLuComp(img)
     wm_lum.wm_write(bitmap, c=2.0)
-    wm_img = wm_lum.get_wm_image()
+    wm_img2 = wm_lum.get_wm_image()
     # read watermark
-    wm_lum = WmLuComp(wm_img)
+    wm_lum = WmLuComp(wm_img2)
     wm_bitmap = wm_lum.wm_read()
     err = np.abs(bitmap - wm_bitmap)
-    print('error:', err.ravel().sum(), err.ravel().sum()/ len(err.ravel()))
+    print('error:', err.ravel().sum(), err.ravel().sum() / len(err.ravel()))
     # skimage.io.imsave('tmp.tiff', wm_img)
     # skimage.io.imshow(wm_img)
+    print('Try Watermark class')
+    # SiP
+    wm = Watermark(img, 'SiP')
+    wm_img3 = wm.watermark_write(p, c=1.5)
+    wm = Watermark(wm_img3, 'SiP')
+    print('Watermark:', wm.watermark_read((len(p),)))
+    # LuComp    
+    wm = Watermark(img, 'LuComp')
+    wm_img4 = wm.watermark_write(bitmap, c=2.5)
+    wm = Watermark(wm_img4, 'LuComp')
+    wm_bitmap = wm.watermark_read()
+    err = np.abs(bitmap - wm_bitmap)
+    print('Watermark error:', err.ravel().sum(), err.ravel().sum() / len(err.ravel()))
+
